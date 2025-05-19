@@ -1,0 +1,434 @@
+//@version=5
+indicator("Kaspa Power Law Sine Wave", overlay=true, max_labels_count=500, max_lines_count=500)
+
+// Correcting the start date to the first available data date and the genesis block date
+genesisDate = timestamp(2021, 11, 7, 0, 0)  // Genesis block date for Kaspa
+firstDataDate = timestamp(2022, 6, 1, 0, 0)  // First date with ticker data for RMSE calculation start
+
+// Milliseconds per day constant
+MS_PER_DAY = 1000 * 60 * 60 * 24.0
+
+// --- Calculate totalDays for the current bar ---
+currentTotalDays = time >= genesisDate ? math.max(1.0, (time - genesisDate) / MS_PER_DAY) : na
+
+// --- Power Law Parameters ---
+group_pl_params = "Power Law Parameters"
+a_initial = input.float(-13.234, 'Initial Power Law Intercept (a)', step=0.001, group=group_pl_params, tooltip="The initial 'a' value for the power law: Price = 10^(a + b * log10(days))")
+b_initial = input.float(4.209, 'Initial Power Law Slope (b)', step=0.001, group=group_pl_params, tooltip="The initial 'b' value (exponent) for the power law.")
+
+// --- Slope Decay Settings ---
+group_slope_decay_settings = "Slope Decay Settings"
+applySlopeDecay = input.bool(true, title="Apply Slope Decay?", group=group_slope_decay_settings, tooltip="If checked, the power law slope 'b' will decay over time.") 
+slopeDecayStartDay = input.int(1, title="Slope Decay Start Day (days since genesis)", minval=1, group=group_slope_decay_settings, tooltip="Slope 'b' starts decaying after this many totalDays since genesis.") 
+slopeDecayRate = input.float(0.000036, title="Slope Decay Rate (per day after start)", minval=0.000001, step=0.000001, group=group_slope_decay_settings, tooltip="Controls speed of slope decay. Smaller value = slower decay. e.g., 0.0001") 
+minSlopeFactor = input.float(0.01, title="Minimum Slope Factor (as % of initial b)", minval=0.01, maxval=1.0, step=0.01, group=group_slope_decay_settings, tooltip="Slope 'b' will not decay below this percentage of its initial value (e.g., 0.25 = 25%).") 
+
+// --- Calculate effective slope 'b' with decay for the current bar ---
+var float currentEffectiveSlope = b_initial 
+if (not na(currentTotalDays))
+    if (applySlopeDecay)
+        if (currentTotalDays > slopeDecayStartDay)
+            float daysSinceSlopeDecayStart_hist = currentTotalDays - slopeDecayStartDay 
+            float slopeDecayEffect_hist = math.exp(-slopeDecayRate * daysSinceSlopeDecayStart_hist) 
+            currentEffectiveSlope := b_initial * math.max(minSlopeFactor, slopeDecayEffect_hist)
+        else
+            currentEffectiveSlope := b_initial 
+    else
+        currentEffectiveSlope := b_initial 
+else
+    currentEffectiveSlope := na 
+
+// --- Sinusoidal Wave Parameters ---
+group_wave_params = "Sinusoidal Wave Parameters"
+applySineWave = input.bool(false, "Apply Sine Wave Modulation?", group=group_wave_params, tooltip="If checked, a sine wave will modulate the Power Law.")
+waveAmplitude = input.float(0.1, "Wave Amplitude (log10 scale)", step=0.01, group=group_wave_params, tooltip="Amplitude of the sine wave in log10 price units. e.g., 0.1 means +/- 10^0.1 factor.")
+wavePeriodDays = input.float(365, "Wave Period (days)", minval=1, group=group_wave_params, tooltip="The length of one full sine wave cycle in days.")
+wavePhaseShiftDays = input.float(0, "Wave Phase Shift (days)", group=group_wave_params, tooltip="Horizontal shift of the wave. Positive shifts wave to the right.")
+waveVerticalOffset = input.float(0.0, "Wave Vertical Offset (log10 scale)", step=0.01, group=group_wave_params, tooltip="Vertical shift of the entire wave in log10 price units.")
+applyWaveDamping = input.bool(false, "Apply Wave Damping?", group=group_wave_params, tooltip="If checked, wave amplitude will decay over time.")
+waveDampingFactor = input.float(0.95, "Wave Damping Factor (per cycle)", minval=0.01, maxval=1.0, step=0.01, group=group_wave_params, tooltip="Factor by which amplitude is multiplied each wave cycle (e.g., 0.95 for 5% decay per cycle). Only active if 'Apply Wave Damping' is checked.")
+
+
+// --- Power Law Calculation for the current bar (potentially with wave) ---
+var float powerLawPrice_plot = na
+if (not na(currentTotalDays) and not na(currentEffectiveSlope) and currentTotalDays > 0)
+    float log_powerLaw_base = a_initial + currentEffectiveSlope * math.log10(currentTotalDays)
+    float wave_component = 0.0
+
+    if (applySineWave and wavePeriodDays > 0)
+        float current_amplitude = waveAmplitude
+        if (applyWaveDamping and waveDampingFactor > 0 and waveDampingFactor < 1)
+            float cycles_passed = currentTotalDays / wavePeriodDays
+            current_amplitude := waveAmplitude * math.pow(waveDampingFactor, cycles_passed)
+        
+        float sineArgument = (2 * math.pi / wavePeriodDays) * (currentTotalDays - wavePhaseShiftDays)
+        wave_component := current_amplitude * math.sin(sineArgument) + waveVerticalOffset
+    
+    powerLawPrice_plot := math.pow(10, log_powerLaw_base + wave_component)
+else
+    powerLawPrice_plot := na
+
+
+// --- RMSE Calculation for the Central Power Law Line ---
+var float sumSqErr = 0.0
+var int barCountForRMSE = 0
+var float rmse_value = na
+
+if not na(close) and not na(powerLawPrice_plot) and time >= firstDataDate 
+    sumSqErr += math.pow(close - powerLawPrice_plot, 2)
+    barCountForRMSE += 1
+
+if barstate.islast and barCountForRMSE > 0
+    float mse = sumSqErr / barCountForRMSE
+    rmse_value := math.sqrt(mse)
+
+
+// Calculate the percentage difference from the Power Law
+var float percentageDifference = na
+if not na(powerLawPrice_plot) and powerLawPrice_plot != 0 
+    percentageDifference := ((close - powerLawPrice_plot) / powerLawPrice_plot) * 100
+
+
+// Create a table to display the percentage difference and RMSE
+var table displayTable = table.new(position.bottom_right, 1, 2, border_width=1) 
+
+if (barstate.islast) 
+    table.cell(displayTable, 0, 0, 
+               text= not na(percentageDifference) ? "PL Delta: " + str.tostring(percentageDifference, "#.##") + "%" : "PL Delta: N/A", 
+               text_color=percentageDifference < 0 ? color.red : color.green, 
+               bgcolor=color.new(color.black, 70), 
+               text_size=size.small)
+    if not na(rmse_value)
+        table.cell(displayTable, 0, 1,
+                   text="RMSE: " + str.tostring(rmse_value, "#.#####"), 
+                   text_color=color.gray,
+                   bgcolor=color.new(color.black, 70),
+                   text_size=size.small)
+    else
+        table.cell(displayTable, 0, 1, text="RMSE: N/A", text_color=color.gray, bgcolor=color.new(color.black, 70), text_size=size.small)
+
+
+// --- Band Settings (Static Multiplier and Dynamic Decay for Band Width) ---
+group_bands_settings = "Band Width Settings"
+bandWidthMultiplier = input.float(1.0, title="Overall Band Width Multiplier", minval=0.1, step=0.1, group=group_bands_settings, tooltip="Overall static multiplier for all band widths (e.g., 1.5 = 50% wider). Applied BEFORE band decay.") 
+
+applyBandWidthDecay = input.bool(false, title="Apply Band Width Decay?", group=group_bands_settings, tooltip="If checked, band widths (deltas) will narrow over time after the Band Decay Start Day.") 
+bandDecayStartDay_input = input.int(365, title="Band Decay Start Day (days since genesis)", minval=1, group=group_bands_settings, tooltip="Band widths start decaying after this many totalDays since genesis.") 
+bandDecayRate_input = input.float(0.0005, title="Band Decay Rate (per day after start)", minval=0.00001, step=0.00001, group=group_bands_settings, tooltip="Controls speed of band width decay. Smaller value = slower decay. e.g., 0.0005") 
+minBandWidthFactor_input = input.float(0.1, title="Minimum Band Width Factor (for deltas)", minval=0.01, maxval=1.0, step=0.01, group=group_bands_settings, tooltip="Band deltas will not shrink below this percentage of their initial scaled width (e.g., 0.1 = 10%).") 
+
+// Calculate dynamic decay multiplier for band widths for the current bar
+var float currentDynamicBandWidthDecayMultiplier = 1.0 
+if (not na(currentTotalDays))
+    if (applyBandWidthDecay)
+        if (currentTotalDays > bandDecayStartDay_input)
+            float daysSinceBandDecayStart_hist = currentTotalDays - bandDecayStartDay_input
+            float bandDecayEffect_hist = math.exp(-bandDecayRate_input * daysSinceBandDecayStart_hist) 
+            currentDynamicBandWidthDecayMultiplier := math.max(minBandWidthFactor_input, bandDecayEffect_hist)
+        else
+            currentDynamicBandWidthDecayMultiplier := 1.0 
+    else
+        currentDynamicBandWidthDecayMultiplier := 1.0 
+else
+    currentDynamicBandWidthDecayMultiplier := na
+
+
+// User-defined initial percentage bands (these will be scaled by multipliers)
+group1 = "Initial Delta Above Bands (%)"
+deltaAbove1 = input.float(2, title="Delta Above 1", group=group1)     
+deltaAbove2 = input.float(4, title="Delta Above 2", group=group1)     
+deltaAbove3 = input.float(8, title="Delta Above 3", group=group1)     
+deltaAbove4 = input.float(16, title="Delta Above 4", group=group1)    
+deltaAbove5 = input.float(32, title="Delta Above 5", group=group1)    
+deltaAbove6 = input.float(64, title="Delta Above 6", group=group1)    
+deltaAbove7 = input.float(128, title="Delta Above 7", group=group1)   
+deltaAbove8 = input.float(256, title="Delta Above 8", group=group1)   
+
+
+group2 = "Initial Delta Below Bands (%)"
+deltaBelow1 = input.float(8, title="Delta Below 1", group=group2)     
+deltaBelow2 = input.float(16, title="Delta Below 2", group=group2)    
+deltaBelow3 = input.float(24, title="Delta Below 3", group=group2)    
+deltaBelow4 = input.float(32, title="Delta Below 4", group=group2)    
+deltaBelow5 = input.float(40, title="Delta Below 5", group=group2)    
+deltaBelow6 = input.float(48, title="Delta Below 6", group=group2)    
+deltaBelow7 = input.float(56, title="Delta Below 7", group=group2)    
+deltaBelow8 = input.float(64, title="Delta Below 8", group=group2)    
+
+
+// Calculate effective deltas for bands for the current bar
+var float effDeltaAbove1 = na 
+var float effDeltaAbove2 = na
+var float effDeltaAbove3 = na
+var float effDeltaAbove4 = na
+var float effDeltaAbove5 = na
+var float effDeltaAbove6 = na
+var float effDeltaAbove7 = na
+var float effDeltaAbove8 = na
+
+var float effDeltaBelow1 = na
+var float effDeltaBelow2 = na
+var float effDeltaBelow3 = na
+var float effDeltaBelow4 = na
+var float effDeltaBelow5 = na
+var float effDeltaBelow6 = na
+var float effDeltaBelow7 = na
+var float effDeltaBelow8 = na
+
+if not na(currentDynamicBandWidthDecayMultiplier)
+    effDeltaAbove1 := deltaAbove1 * bandWidthMultiplier * currentDynamicBandWidthDecayMultiplier
+    effDeltaAbove2 := deltaAbove2 * bandWidthMultiplier * currentDynamicBandWidthDecayMultiplier
+    effDeltaAbove3 := deltaAbove3 * bandWidthMultiplier * currentDynamicBandWidthDecayMultiplier
+    effDeltaAbove4 := deltaAbove4 * bandWidthMultiplier * currentDynamicBandWidthDecayMultiplier
+    effDeltaAbove5 := deltaAbove5 * bandWidthMultiplier * currentDynamicBandWidthDecayMultiplier 
+    effDeltaAbove6 := deltaAbove6 * bandWidthMultiplier * currentDynamicBandWidthDecayMultiplier 
+    effDeltaAbove7 := deltaAbove7 * bandWidthMultiplier * currentDynamicBandWidthDecayMultiplier 
+    effDeltaAbove8 := deltaAbove8 * bandWidthMultiplier * currentDynamicBandWidthDecayMultiplier 
+
+    effDeltaBelow1 := deltaBelow1 * bandWidthMultiplier * currentDynamicBandWidthDecayMultiplier
+    effDeltaBelow2 := deltaBelow2 * bandWidthMultiplier * currentDynamicBandWidthDecayMultiplier
+    effDeltaBelow3 := deltaBelow3 * bandWidthMultiplier * currentDynamicBandWidthDecayMultiplier
+    effDeltaBelow4 := deltaBelow4 * bandWidthMultiplier * currentDynamicBandWidthDecayMultiplier
+    effDeltaBelow5 := deltaBelow5 * bandWidthMultiplier * currentDynamicBandWidthDecayMultiplier 
+    effDeltaBelow6 := deltaBelow6 * bandWidthMultiplier * currentDynamicBandWidthDecayMultiplier 
+    effDeltaBelow7 := deltaBelow7 * bandWidthMultiplier * currentDynamicBandWidthDecayMultiplier 
+    effDeltaBelow8 := deltaBelow8 * bandWidthMultiplier * currentDynamicBandWidthDecayMultiplier 
+
+
+// Calculate band prices using effective deltas for the current bar
+var float bandAbove1 = na 
+var float bandAbove2 = na 
+var float bandAbove3 = na 
+var float bandAbove4 = na 
+var float bandAbove5 = na 
+var float bandAbove6 = na 
+var float bandAbove7 = na 
+var float bandAbove8 = na
+
+var float bandBelow1 = na 
+var float bandBelow2 = na 
+var float bandBelow3 = na 
+var float bandBelow4 = na 
+var float bandBelow5 = na 
+var float bandBelow6 = na 
+var float bandBelow7 = na 
+var float bandBelow8 = na
+
+if not na(powerLawPrice_plot) and not na(effDeltaAbove1) 
+    bandAbove1 := powerLawPrice_plot * (1 + effDeltaAbove1 / 100)
+    bandAbove2 := powerLawPrice_plot * (1 + effDeltaAbove2 / 100)
+    bandAbove3 := powerLawPrice_plot * (1 + effDeltaAbove3 / 100)
+    bandAbove4 := powerLawPrice_plot * (1 + effDeltaAbove4 / 100)
+    bandAbove5 := powerLawPrice_plot * (1 + effDeltaAbove5 / 100) 
+    bandAbove6 := powerLawPrice_plot * (1 + effDeltaAbove6 / 100) 
+    bandAbove7 := powerLawPrice_plot * (1 + effDeltaAbove7 / 100) 
+    bandAbove8 := powerLawPrice_plot * (1 + effDeltaAbove8 / 100) 
+
+    bandBelow1 := powerLawPrice_plot * (1 - effDeltaBelow1 / 100)
+    bandBelow2 := powerLawPrice_plot * (1 - effDeltaBelow2 / 100)
+    bandBelow3 := powerLawPrice_plot * (1 - effDeltaBelow3 / 100)
+    bandBelow4 := powerLawPrice_plot * (1 - effDeltaBelow4 / 100)
+    bandBelow5 := powerLawPrice_plot * (1 - effDeltaBelow5 / 100) 
+    bandBelow6 := powerLawPrice_plot * (1 - effDeltaBelow6 / 100) 
+    bandBelow7 := powerLawPrice_plot * (1 - effDeltaBelow7 / 100) 
+    bandBelow8 := powerLawPrice_plot * (1 - effDeltaBelow8 / 100) 
+
+
+// Plotting Power Law and Bands for historical data
+plot(powerLawPrice_plot, color=color.white, linewidth=2, title="Power Law (Waved)")
+plot(bandAbove1, color=color.new(color.red, 70), linewidth=1, title="Band A1 (+)")
+plot(bandAbove2, color=color.new(color.orange, 70), linewidth=1, title="Band A2 (+)")
+plot(bandAbove3, color=color.new(color.yellow, 70), linewidth=1, title="Band A3 (+)")
+plot(bandAbove4, color=color.new(color.green, 70), linewidth=1, title="Band A4 (+)")
+plot(bandAbove5, color=color.new(color.lime, 70), linewidth=1, title="Band A5 (+)") 
+plot(bandAbove6, color=color.new(color.teal, 70), linewidth=1, title="Band A6 (+)")    
+plot(bandAbove7, color=color.new(color.aqua, 70), linewidth=1, title="Band A7 (+)")    
+plot(bandAbove8, color=color.new(color.silver, 70), linewidth=1, title="Band A8 (+)")  
+
+plot(bandBelow1, color=color.new(color.green, 70), linewidth=1, title="Band B1 (-)")
+plot(bandBelow2, color=color.new(color.blue, 70), linewidth=1, title="Band B2 (-)")
+plot(bandBelow3, color=color.new(color.purple, 70), linewidth=1, title="Band B3 (-)")
+plot(bandBelow4, color=color.new(color.maroon, 70), linewidth=1, title="Band B4 (-)")
+plot(bandBelow5, color=color.new(color.fuchsia, 70), linewidth=1, title="Band B5 (-)") 
+plot(bandBelow6, color=color.new(color.navy, 70), linewidth=1, title="Band B6 (-)")     
+plot(bandBelow7, color=color.new(color.olive, 70), linewidth=1, title="Band B7 (-)")    
+plot(bandBelow8, color=color.new(color.gray, 70), linewidth=1, title="Band B8 (-)")     
+
+
+// --- Future Projection Settings ---
+group_future_projection = "Future Projection Settings"
+futureProjectionLengthDays = input.int(503, title="Future Projection Length (Days)", minval=0, group=group_future_projection, tooltip="Number of days to project the model into the future. Set to 0 to disable.") 
+futureProjectionStepDays = input.int(21, title="Future Projection Step (Days)", minval=1, group=group_future_projection, tooltip="Interval for plotting future points (e.g., 1 for daily, 7 for weekly).") 
+
+// Plot future projections on the last bar
+if barstate.islast and futureProjectionLengthDays > 0 and not na(powerLawPrice_plot) 
+    var float prev_powerLawPrice = na 
+    var float prev_bandAbove1 = na
+    var float prev_bandAbove2 = na
+    var float prev_bandAbove3 = na
+    var float prev_bandAbove4 = na
+    var float prev_bandAbove5 = na
+    var float prev_bandAbove6 = na
+    var float prev_bandAbove7 = na
+    var float prev_bandAbove8 = na
+    var float prev_bandBelow1 = na
+    var float prev_bandBelow2 = na
+    var float prev_bandBelow3 = na
+    var float prev_bandBelow4 = na
+    var float prev_bandBelow5 = na
+    var float prev_bandBelow6 = na
+    var float prev_bandBelow7 = na
+    var float prev_bandBelow8 = na
+    var int prev_time = na 
+    
+    prev_powerLawPrice := powerLawPrice_plot
+    prev_bandAbove1  := bandAbove1
+    prev_bandAbove2  := bandAbove2
+    prev_bandAbove3  := bandAbove3
+    prev_bandAbove4  := bandAbove4
+    prev_bandAbove5  := bandAbove5 
+    prev_bandAbove6  := bandAbove6 
+    prev_bandAbove7  := bandAbove7 
+    prev_bandAbove8  := bandAbove8 
+    prev_bandBelow1  := bandBelow1
+    prev_bandBelow2  := bandBelow2
+    prev_bandBelow3  := bandBelow3
+    prev_bandBelow4  := bandBelow4
+    prev_bandBelow5  := bandBelow5 
+    prev_bandBelow6  := bandBelow6 
+    prev_bandBelow7  := bandBelow7 
+    prev_bandBelow8  := bandBelow8 
+    prev_time        := time 
+
+
+    for i = 1 to futureProjectionLengthDays / futureProjectionStepDays
+        float days_offset = float(i * futureProjectionStepDays) 
+        int time_current_future_point = prev_time 
+        if (i == 1) // For the first segment, calculate offset from the actual last bar
+            time_current_future_point := time + int(days_offset * MS_PER_DAY)
+        else // For subsequent segments, calculate offset from the previous future point
+            time_current_future_point := prev_time + int(futureProjectionStepDays * MS_PER_DAY)
+
+
+        float future_totalDays_calc = na
+        if time_current_future_point >= genesisDate
+            future_totalDays_calc := math.max(1.0, (time_current_future_point - genesisDate) / MS_PER_DAY)
+        
+        if na(future_totalDays_calc) or future_totalDays_calc <= 0 
+            continue 
+
+        float future_effectiveSlope = b_initial 
+        if (applySlopeDecay)
+            if (future_totalDays_calc > slopeDecayStartDay)
+                float l_daysSinceSlopeDecayStart = future_totalDays_calc - slopeDecayStartDay
+                float l_slopeDecayEffect = math.exp(-slopeDecayRate * l_daysSinceSlopeDecayStart)
+                future_effectiveSlope := b_initial * math.max(minSlopeFactor, l_slopeDecayEffect) 
+            else
+                future_effectiveSlope := b_initial 
+        else 
+            future_effectiveSlope := b_initial
+
+        float future_log_powerLaw_base = a_initial + future_effectiveSlope * math.log10(future_totalDays_calc)
+        float future_wave_component = 0.0
+
+        if (applySineWave and wavePeriodDays > 0)
+            float future_current_amplitude = waveAmplitude
+            if (applyWaveDamping and waveDampingFactor > 0 and waveDampingFactor < 1)
+                float future_cycles_passed = future_totalDays_calc / wavePeriodDays
+                future_current_amplitude := waveAmplitude * math.pow(waveDampingFactor, future_cycles_passed)
+            
+            float future_sineArgument = (2 * math.pi / wavePeriodDays) * (future_totalDays_calc - wavePhaseShiftDays)
+            future_wave_component := future_current_amplitude * math.sin(future_sineArgument) + waveVerticalOffset
+        
+        float future_powerLawPrice = math.pow(10, future_log_powerLaw_base + future_wave_component)
+
+
+        float future_dynamicBandWidthDecayMultiplier = 1.0
+        if (applyBandWidthDecay)
+            if (future_totalDays_calc > bandDecayStartDay_input) 
+                float l_daysSinceBandDecayStart = future_totalDays_calc - bandDecayStartDay_input
+                float l_bandDecayEffect = math.exp(-bandDecayRate_input * l_daysSinceBandDecayStart) 
+                future_dynamicBandWidthDecayMultiplier := math.max(minBandWidthFactor_input, l_bandDecayEffect) 
+            else 
+                future_dynamicBandWidthDecayMultiplier := 1.0
+        else 
+            future_dynamicBandWidthDecayMultiplier := 1.0
+            
+        float future_effDeltaAbove1 = deltaAbove1 * bandWidthMultiplier * future_dynamicBandWidthDecayMultiplier
+        float future_effDeltaAbove2 = deltaAbove2 * bandWidthMultiplier * future_dynamicBandWidthDecayMultiplier
+        float future_effDeltaAbove3 = deltaAbove3 * bandWidthMultiplier * future_dynamicBandWidthDecayMultiplier
+        float future_effDeltaAbove4 = deltaAbove4 * bandWidthMultiplier * future_dynamicBandWidthDecayMultiplier
+        float future_effDeltaAbove5 = deltaAbove5 * bandWidthMultiplier * future_dynamicBandWidthDecayMultiplier 
+        float future_effDeltaAbove6 = deltaAbove6 * bandWidthMultiplier * future_dynamicBandWidthDecayMultiplier 
+        float future_effDeltaAbove7 = deltaAbove7 * bandWidthMultiplier * future_dynamicBandWidthDecayMultiplier 
+        float future_effDeltaAbove8 = deltaAbove8 * bandWidthMultiplier * future_dynamicBandWidthDecayMultiplier 
+
+        float future_effDeltaBelow1 = deltaBelow1 * bandWidthMultiplier * future_dynamicBandWidthDecayMultiplier
+        float future_effDeltaBelow2 = deltaBelow2 * bandWidthMultiplier * future_dynamicBandWidthDecayMultiplier
+        float future_effDeltaBelow3 = deltaBelow3 * bandWidthMultiplier * future_dynamicBandWidthDecayMultiplier
+        float future_effDeltaBelow4 = deltaBelow4 * bandWidthMultiplier * future_dynamicBandWidthDecayMultiplier
+        float future_effDeltaBelow5 = deltaBelow5 * bandWidthMultiplier * future_dynamicBandWidthDecayMultiplier 
+        float future_effDeltaBelow6 = deltaBelow6 * bandWidthMultiplier * future_dynamicBandWidthDecayMultiplier 
+        float future_effDeltaBelow7 = deltaBelow7 * bandWidthMultiplier * future_dynamicBandWidthDecayMultiplier 
+        float future_effDeltaBelow8 = deltaBelow8 * bandWidthMultiplier * future_dynamicBandWidthDecayMultiplier 
+
+        float future_bandAbove1 = future_powerLawPrice * (1 + future_effDeltaAbove1 / 100)
+        float future_bandAbove2 = future_powerLawPrice * (1 + future_effDeltaAbove2 / 100)
+        float future_bandAbove3 = future_powerLawPrice * (1 + future_effDeltaAbove3 / 100)
+        float future_bandAbove4 = future_powerLawPrice * (1 + future_effDeltaAbove4 / 100)
+        float future_bandAbove5 = future_powerLawPrice * (1 + future_effDeltaAbove5 / 100) 
+        float future_bandAbove6 = future_powerLawPrice * (1 + future_effDeltaAbove6 / 100) 
+        float future_bandAbove7 = future_powerLawPrice * (1 + future_effDeltaAbove7 / 100) 
+        float future_bandAbove8 = future_powerLawPrice * (1 + future_effDeltaAbove8 / 100) 
+
+        float future_bandBelow1 = future_powerLawPrice * (1 - future_effDeltaBelow1 / 100)
+        float future_bandBelow2 = future_powerLawPrice * (1 - future_effDeltaBelow2 / 100)
+        float future_bandBelow3 = future_powerLawPrice * (1 - future_effDeltaBelow3 / 100)
+        float future_bandBelow4 = future_powerLawPrice * (1 - future_effDeltaBelow4 / 100)
+        float future_bandBelow5 = future_powerLawPrice * (1 - future_effDeltaBelow5 / 100) 
+        float future_bandBelow6 = future_powerLawPrice * (1 - future_effDeltaBelow6 / 100) 
+        float future_bandBelow7 = future_powerLawPrice * (1 - future_effDeltaBelow7 / 100) 
+        float future_bandBelow8 = future_powerLawPrice * (1 - future_effDeltaBelow8 / 100) 
+
+        
+        line.new(prev_time, prev_powerLawPrice, time_current_future_point, future_powerLawPrice, xloc=xloc.bar_time, color=color.white, style=line.style_dashed)
+        line.new(prev_time, prev_bandAbove1,  time_current_future_point, future_bandAbove1,  xloc=xloc.bar_time, color=color.new(color.red, 70), style=line.style_dashed)
+        line.new(prev_time, prev_bandAbove2,  time_current_future_point, future_bandAbove2,  xloc=xloc.bar_time, color=color.new(color.orange, 70), style=line.style_dashed)
+        line.new(prev_time, prev_bandAbove3,  time_current_future_point, future_bandAbove3,  xloc=xloc.bar_time, color=color.new(color.yellow, 70), style=line.style_dashed)
+        line.new(prev_time, prev_bandAbove4,  time_current_future_point, future_bandAbove4,  xloc=xloc.bar_time, color=color.new(color.green, 70), style=line.style_dashed)
+        line.new(prev_time, prev_bandAbove5,  time_current_future_point, future_bandAbove5,  xloc=xloc.bar_time, color=color.new(color.lime, 70), style=line.style_dashed) 
+        line.new(prev_time, prev_bandAbove6,  time_current_future_point, future_bandAbove6,  xloc=xloc.bar_time, color=color.new(color.teal, 70), style=line.style_dashed) 
+        line.new(prev_time, prev_bandAbove7,  time_current_future_point, future_bandAbove7,  xloc=xloc.bar_time, color=color.new(color.aqua, 70), style=line.style_dashed) 
+        line.new(prev_time, prev_bandAbove8,  time_current_future_point, future_bandAbove8,  xloc=xloc.bar_time, color=color.new(color.silver, 70), style=line.style_dashed) 
+        
+        line.new(prev_time, prev_bandBelow1,  time_current_future_point, future_bandBelow1,  xloc=xloc.bar_time, color=color.new(color.green, 70), style=line.style_dashed)
+        line.new(prev_time, prev_bandBelow2,  time_current_future_point, future_bandBelow2,  xloc=xloc.bar_time, color=color.new(color.blue, 70), style=line.style_dashed)
+        line.new(prev_time, prev_bandBelow3,  time_current_future_point, future_bandBelow3,  xloc=xloc.bar_time, color=color.new(color.purple, 70), style=line.style_dashed)
+        line.new(prev_time, prev_bandBelow4,  time_current_future_point, future_bandBelow4,  xloc=xloc.bar_time, color=color.new(color.maroon, 70), style=line.style_dashed)
+        line.new(prev_time, prev_bandBelow5,  time_current_future_point, future_bandBelow5,  xloc=xloc.bar_time, color=color.new(color.fuchsia, 70), style=line.style_dashed) 
+        line.new(prev_time, prev_bandBelow6,  time_current_future_point, future_bandBelow6,  xloc=xloc.bar_time, color=color.new(color.navy, 70), style=line.style_dashed) 
+        line.new(prev_time, prev_bandBelow7,  time_current_future_point, future_bandBelow7,  xloc=xloc.bar_time, color=color.new(color.olive, 70), style=line.style_dashed) 
+        line.new(prev_time, prev_bandBelow8,  time_current_future_point, future_bandBelow8,  xloc=xloc.bar_time, color=color.new(color.gray, 70), style=line.style_dashed) 
+
+        prev_time := time_current_future_point 
+        prev_powerLawPrice := future_powerLawPrice
+        prev_bandAbove1  := future_bandAbove1
+        prev_bandAbove2  := future_bandAbove2
+        prev_bandAbove3  := future_bandAbove3
+        prev_bandAbove4  := future_bandAbove4
+        prev_bandAbove5  := future_bandAbove5
+        prev_bandAbove6  := future_bandAbove6
+        prev_bandAbove7  := future_bandAbove7
+        prev_bandAbove8  := future_bandAbove8
+        prev_bandBelow1  := future_bandBelow1
+        prev_bandBelow2  := future_bandBelow2
+        prev_bandBelow3  := future_bandBelow3
+        prev_bandBelow4  := future_bandBelow4
+        prev_bandBelow5  := future_bandBelow5
+        prev_bandBelow6  := future_bandBelow6
+        prev_bandBelow7  := future_bandBelow7
+        prev_bandBelow8  := future_bandBelow8
+    // End of for loop
+// End of if barstate.islast block
+
+// Allocation and Label functionality has been removed.
